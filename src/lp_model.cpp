@@ -54,8 +54,8 @@ const lp::ConstraintRows commonGenerateRows(
     if (bound_above && bound_below) {
         Eigen::MatrixXd A(2, num_variables);
         Eigen::MatrixXd b(2, 1);
-        A << row, (row * -1);
-        b << bounds.first, -bounds.second;
+        A << (row * -1), row;
+        b << -bounds.first, bounds.second;
         return lp::ConstraintRows(A, b);
     }
 
@@ -63,10 +63,10 @@ const lp::ConstraintRows commonGenerateRows(
 
     if (bound_below) {
         b << bounds.first;
-        return lp::ConstraintRows(row, b);
+        return lp::ConstraintRows(-row, -b);
     } else {
         b << bounds.second;
-        return lp::ConstraintRows(-row, -b);
+        return lp::ConstraintRows(row, b);
     }
 }
 
@@ -78,6 +78,14 @@ std::shared_ptr<lp::LpVariable> lp::LpSolver::addVariable() {
     const size_t id = lp_variables_.size();
     lp_variables_.push_back(std::make_shared<lp::LpVariable>(id, 0));
     lp_objective_.emplace_back(0);  // c_id
+    return lp_variables_.at(id);
+}
+
+std::shared_ptr<lp::LpVariable> lp::LpSolver::addSlackVariable() {
+    const size_t id = lp_variables_.size();
+    lp_variables_.push_back(std::make_shared<lp::LpVariable>(id, 0));
+    lp_objective_.emplace_back(0);  // c_id
+    lp_variables_.at(id)->setLb(0);
     return lp_variables_.at(id);
 }
 
@@ -155,6 +163,7 @@ int appendRowsToMatrices(
     return n_added;
 }
 
+// TODO: This should produce matrices for standard form.
 lp::MatrixContainer lp::LpSolver::getMatrices() {
     // Generate the matrix objects representing the constraints and the
     // objective
@@ -183,6 +192,117 @@ lp::MatrixContainer lp::LpSolver::getMatrices() {
     mc.b = b_ptr;
 
     return mc;
+}
+
+/**
+ * Make function to turn into standard form.
+ * For each constraint, if lb not equal to ub, add slack variable
+ * For each variable, if not lower bound is 0, add x_p x_m and bound both from
+ * below
+ *
+ * I feel like maybe we should have several stages
+ * 1. Add slack variables
+ * 2. Convert all variables to >= 0
+ * 3. Done?
+ *
+ *
+ */
+
+template <typename T>
+// Copies object pointed to and makes a new shared pointer to the copy.
+std::shared_ptr<T> copySharedPtr(std::shared_ptr<T> ptr) {
+    return std::make_shared<T>(*ptr);
+}
+
+void addSlackVariableToConstraint(
+    lp::LpSolver& lp_solver, std::shared_ptr<lp::LpConstraint>& constraint) {
+    auto slack_var = lp_solver.addSlackVariable();
+    constraint->addVariable(1, slack_var);
+}
+
+void lp::LpSolver::addSlack() {
+    // Fill in lp_constraints_standard_ by tightening the constraints found in
+    // lp_constraints Begin by setting using the lpConstraints objects
+    const auto isTight = [](const pair_dd bounds) {
+        return bounds.first == bounds.second;
+    };
+    // Assume lp_variables_standard_ is filled with the current vars
+    for (const auto& constraint_ptr : lp_constraints_) {
+        if (isTight(constraint_ptr->bounds)) {
+            lp_constraints_standard_.push_back(constraint_ptr);
+        } else {
+            // The constraint is soft
+            auto ub_hard_constraint = copySharedPtr(constraint_ptr);
+            auto lb_hard_constraint = copySharedPtr(constraint_ptr);
+            *lb_hard_constraint = (*ub_hard_constraint) * -1.0;
+            // a'x <= b   This one is good. This is upper bound
+            // a'x >= b   This one needs to be multiplied by -1 then do the same
+            addSlackVariableToConstraint(*this, ub_hard_constraint);
+            addSlackVariableToConstraint(*this, lb_hard_constraint);
+            lp_constraints_standard_.push_back(ub_hard_constraint);
+            lp_constraints_standard_.push_back(lb_hard_constraint);
+        }
+    }
+
+    const auto is_not_slack_var = [](std::shared_ptr<lp::LpVariable> var_ptr) {
+        return !var_ptr->isSlack();
+    };
+
+    int num_non_slack_vars =
+        std::ranges::count_if(lp_variables_, is_not_slack_var);
+
+    for (int i = 0; i < num_non_slack_vars; ++i) {
+        auto variable_ptr = lp_variables_.at(i);
+        if (pair_dd bounds = variable_ptr->bounds;
+            isTight(bounds)) {  // Weird situation. If this is the case, we
+                                // should actually remove the variable.
+            utils::warn(
+                "Variable has same lower and upper bound, rendering it "
+                "useless.");
+            lp::LpConstraint variable_constraint;
+            variable_constraint.setBounds(bounds.first, bounds.first);
+            variable_constraint.addVariable(1, variable_ptr);
+            lp_constraints_standard_.push_back(
+                std::make_shared<lp::LpConstraint>(variable_constraint));
+        } else {
+            if (pair_dd bounds = variable_ptr->bounds;
+                bounds.first == 0 &&
+                bounds.second == std::numeric_limits<double>::max()) {
+                continue;  // No slack needs to be added, it is bounded as
+                           // desired.
+            }
+            auto ub_constraint = std::make_shared<lp::LpConstraint>();
+            auto lb_constraint = std::make_shared<lp::LpConstraint>();
+            ub_constraint->setUb(variable_ptr->bounds.second);
+            lb_constraint->setUb(-(variable_ptr->bounds.first));
+            ub_constraint->addVariable(1, variable_ptr);
+            lb_constraint->addVariable(-1, variable_ptr);
+            addSlackVariableToConstraint(*this, ub_constraint);
+            addSlackVariableToConstraint(*this, lb_constraint);
+            lp_constraints_standard_.push_back(ub_constraint);
+            lp_constraints_standard_.push_back(lb_constraint);
+        }
+    }
+}
+
+// TODO:
+void lp::LpSolver::makeVarsNonNegative() {
+    // Todo, all vars that have first bound < 0 is only interesting here, others
+    // will be fixed by addSlack
+    for (const auto& variable_ptr : lp_variables_) {
+        if (variable_ptr->bounds.first >= 0) {
+            lp_variables_standard_.push_back(
+                std::make_shared<lp::LpVariable>(*variable_ptr));
+        } else {
+            auto xp = *variable_ptr;  // Copy and set lower bound to 0
+            // Here we want to add the variable xm to the problem
+            // Should we just configure the original or add logic for the
+            // standard version? Then it would be nice to have a way here to
+            // just makeNonNegative(var); and then it does everything
+            // automatically and in there there is a function to generate id and
+            // everything automatically...
+        }
+    }
 }
 
 // Lp solver
@@ -237,6 +357,29 @@ const lp::ConstraintRows lp::LpConstraint::generateRows(
         row(0, vars.at(i)) = coeffs.at(i);
     }
     return commonGenerateRows(row, bounds);
+}
+
+lp::LpConstraint lp::LpConstraint::operator*(const double scale) const {
+    if (scale == 0) {
+        throw std::invalid_argument("Scaling constraint by 0 is not valid.");
+    }
+    lp::LpConstraint new_constraint;
+    new_constraint.coeffs.resize(this->coeffs.size());
+    std::ranges::transform(this->coeffs, new_constraint.coeffs.begin(),
+                           [scale](double x) { return scale * x; });
+
+    if (scale < 0) {
+        new_constraint.setBounds(this->bounds.second * scale,
+                                 this->bounds.first * scale);
+    } else {
+        new_constraint.setBounds(this->bounds.first * scale,
+                                 this->bounds.second * scale);
+    }
+
+    // Add vars also
+    new_constraint.vars = this->vars;
+
+    return new_constraint;
 }
 
 // Lp constraint

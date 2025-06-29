@@ -17,6 +17,8 @@
 
 namespace lp {
 
+using pair_dd = std::pair<double, double>;
+
 struct MatrixContainer {
     std::shared_ptr<Eigen::MatrixXd> A;
     std::shared_ptr<Eigen::MatrixXd> b;
@@ -35,14 +37,16 @@ struct ConstraintRows {
 struct LpVariable {
     const size_t id;
     double val;
-    std::pair<double, double> bounds = {std::numeric_limits<double>::lowest(),
-                                        std::numeric_limits<double>::max()};
+    pair_dd bounds = {std::numeric_limits<double>::lowest(),
+                      std::numeric_limits<double>::max()};
+    bool is_slack = false;
 
     void setLb(const double lb);
     void setUb(const double ub);
     void setBounds(const double lb, const double ub);
     const size_t getId(void) const { return id; };
     const ConstraintRows generateRows(const size_t num_variables) const;
+    const bool isSlack() const { return is_slack; }
 };
 
 /**
@@ -55,8 +59,8 @@ struct LpVariable {
  */
 struct LpConstraint {
     // first = lb, second = ub
-    std::pair<double, double> bounds = {std::numeric_limits<double>::lowest(),
-                                        std::numeric_limits<double>::max()};
+    pair_dd bounds = {std::numeric_limits<double>::lowest(),
+                      std::numeric_limits<double>::max()};
     std::vector<size_t> vars;
     std::vector<double> coeffs;
     void setBounds(const double lb, const double ub);
@@ -64,6 +68,7 @@ struct LpConstraint {
     void setUb(const double ub);
     void addVariable(const double coeff, const std::shared_ptr<LpVariable> var);
     const ConstraintRows generateRows(const size_t num_variables) const;
+    LpConstraint operator*(const double other) const;
 };
 
 class LpSolver {
@@ -77,10 +82,15 @@ class LpSolver {
 
    public:
     std::shared_ptr<LpVariable> addVariable();
+    std::shared_ptr<LpVariable> addSlackVariable();
     std::shared_ptr<LpConstraint> addConstraint();
     const std::vector<std::shared_ptr<LpConstraint>> getConstraints(
         void) const {
         return lp_constraints_;
+    }
+    const std::vector<std::shared_ptr<LpConstraint>> getStandardConstraints(
+        void) const {
+        return lp_constraints_standard_;
     }
     void addToObjective(const LpVariable &var, const double coeff);
     const std::vector<std::shared_ptr<LpVariable>> getVars(void) const {
@@ -91,9 +101,14 @@ class LpSolver {
     Eigen::MatrixXd getMatricesStandard();
 
     const int numConstraintRows() const;
+    const int numStandardConstraintRows() const {
+        return lp_constraints_standard_.size();
+    }
     double evaluateObjective(void);
 
-    void toStandard(void) {};
+    void toStandard(void);
+    void makeVarsNonNegative(void);
+    void addSlack(void);
 };
 
 }  // namespace lp

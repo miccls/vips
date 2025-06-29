@@ -40,17 +40,17 @@ TEST(TestLpSolver, TestVariableToRow) {
     const auto row_standard = var_standard.generateRows(num_variables);
     Eigen::MatrixXd expected_standard_lhs(2, num_variables);
     Eigen::MatrixXd expected_standard_rhs(2, 1);
-    expected_standard_lhs << 1, 0, 0, -1, 0, 0;
+    expected_standard_lhs << -1, 0, 0, 1, 0, 0;
 
-    expected_standard_rhs << bounds_standard.first, -bounds_standard.second;
+    expected_standard_rhs << -bounds_standard.first, bounds_standard.second;
     EXPECT_EQ(row_standard.lhs, expected_standard_lhs);
     EXPECT_EQ(row_standard.rhs, expected_standard_rhs);
 
     const auto row_general = var_general.generateRows(num_variables);
     Eigen::MatrixXd expected_general_lhs(1, num_variables);
     Eigen::MatrixXd expected_general_rhs(1, 1);
-    expected_general_lhs << 0, 1, 0;
-    expected_general_rhs << bounds_general.first;
+    expected_general_lhs << 0, -1, 0;
+    expected_general_rhs << -bounds_general.first;
 
     EXPECT_EQ(row_general.lhs, expected_general_lhs);
     EXPECT_EQ(row_general.rhs, expected_general_rhs);
@@ -84,6 +84,35 @@ TEST(TestLpSolver, TestConstraintWithBounds) {
 
     // Check throw when bounds are invalid
     ASSERT_THROW(lp_constraint_both.setBounds(ub, lb), std::invalid_argument);
+}
+
+TEST(TestLpSolver, TestConstraintScaling) {
+    lp::LpConstraint lp_constraint;
+    lp_constraint.coeffs = {1, 2, 3};
+    lp_constraint.setBounds(-2, 5);
+    // Positive test
+    double positive_scale = 3.0;
+    const auto positive_scaled_constraint = lp_constraint * positive_scale;
+    const std::vector<double> expected_positive_scaled_coeffs = {
+        1 * positive_scale, 2 * positive_scale, 3 * positive_scale};
+    EXPECT_EQ(positive_scaled_constraint.coeffs,
+              expected_positive_scaled_coeffs);
+    EXPECT_EQ(lp_constraint.bounds.first * positive_scale,
+              positive_scaled_constraint.bounds.first);
+    EXPECT_EQ(lp_constraint.bounds.second * positive_scale,
+              positive_scaled_constraint.bounds.second);
+    // Negative test
+    double negative_scale = -3.0;
+    const auto negative_scaled_constraint = lp_constraint * negative_scale;
+    const std::vector<double> expected_negative_scaled_coeffs = {
+        1 * negative_scale, 2 * negative_scale, 3 * negative_scale};
+    EXPECT_EQ(negative_scaled_constraint.coeffs,
+              expected_negative_scaled_coeffs);
+    // Notice opposite order
+    EXPECT_EQ(lp_constraint.bounds.second * negative_scale,
+              negative_scaled_constraint.bounds.first);
+    EXPECT_EQ(lp_constraint.bounds.first * negative_scale,
+              negative_scaled_constraint.bounds.second);
 }
 
 TEST(TestLpSolver, TestConstraintRow) {
@@ -141,6 +170,54 @@ TEST(TestLpSolver, TestObjective) {
     EXPECT_EQ(lp_solver.evaluateObjective(), 42);
 }
 
+TEST(TestLpSolver, TestAddSlack) {
+    /**
+     * The problem set up in this test is:
+     * -4 <= 10*x1 + 50*x2 <= 12
+     * -1 <=    x1         <= 1
+     * -2 <=            x2 <= 2
+     *
+     * After adding slack it should be turned into
+     *  10*x1 + 50*x2 + s1 = 12
+     * -10*x1 - 50*x2 + s2 = 4
+     *     x1         + s3 = 1
+     *    -x1         + s4 = 1
+     *             x2 + s5 = 2
+     *            -x2 + s6 = 2
+     *
+     * And here we want our constraints vector to be filled with all of these.
+     * So we should start out with 1 constraint and end up with 6.
+     * The number of variables should grow with 6 also.
+     *
+     */
+
+    lp::LpSolver lp_solver;
+    auto var1 = lp_solver.addVariable();
+    auto var2 = lp_solver.addVariable();
+    var1->setBounds(-1, 1);
+    var2->setBounds(-2, 2);
+    auto constraint = lp_solver.addConstraint();
+    constraint->addVariable(10, var1);
+    constraint->addVariable(50, var2);
+    constraint->setBounds(-4, 12);
+
+    EXPECT_EQ(lp_solver.getConstraints().size(), 1);
+    EXPECT_EQ(lp_solver.getVars().size(), 2);
+
+    lp_solver.addSlack();
+
+    EXPECT_EQ(lp_solver.getStandardConstraints().size(), 6);
+    EXPECT_EQ(lp_solver.getVars().size(), 8);
+    // TODO: Explicitly check all id's and coefficients instead of
+    // checking manually.
+    for (const auto constraint_ptr : lp_solver.getStandardConstraints()) {
+        for (const auto id : constraint_ptr->vars) {
+            std::cout << id << " ";
+        }
+        std::cout << std::endl;
+    }
+}
+
 TEST(TestLpSolver, TestToStandardForm) {
     /**
      * Convert the problem
@@ -148,14 +225,14 @@ TEST(TestLpSolver, TestToStandardForm) {
      * maximize 1.0 * x_1 + 2.0 * x_2 - 3.0 * x_3
      *      subject to
      *               x_1 +            10.0 * x_3 <= 50
-     *                     8.0 * x_2 - 3.0 * x_3 >= 10
-     *         2.0 * x_1 - 6.0 * x_2             >= 3
-     *               x_1                         >= -10
-     *              -x_1                         >= -10
-     *                           x_2             >= -1
-     *                          -x_2             >= -1
-     *                                       x_3 >= -0.1
-     *                                      -x_3 >= -0.1
+     *                     8.0 * x_2 - 3.0 * x_3 <= 10
+     *         2.0 * x_1 - 6.0 * x_2             <= 3
+     *               x_1                         <= 10
+     *               x_1                         >=-10
+     *                           x_2             <= 1
+     *                           x_2             >=-1
+     *                                       x_3 <= 0.1
+     *                                       x_3 >=-0.1
      * to standard frorm
      *
      * The correct answer is obtained by replacing each variable
@@ -167,20 +244,20 @@ TEST(TestLpSolver, TestToStandardForm) {
      * + 3.0 * x_3m
      * subject to
      * x_1p - x1_m + 10.0 * x_3p - 10.0 * x_3m <= 50
-     * 8.0 * x_2p - 8.0 * x_2m - 3.0 * x_3p + 3.0 * x_3m >= 10
-     * 2.0 * x_1p - 2.0 * x_1m - 6.0 * x_2p + 6.0 * x_2m >= 3
-     * -x_1m >= -10
-     * -x_1p >= -10
-     * -x_2m >= -1
-     * -x_2p >= -1
-     * -x_3m >= -0.1
-     * -x_3p >= -0.1
+     * 8.0 * x_2p - 8.0 * x_2m - 3.0 * x_3p + 3.0 * x_3m <= 10
+     * 2.0 * x_1p - 2.0 * x_1m - 6.0 * x_2p + 6.0 * x_2m <= 3
+     *  x_1m <= 10
+     *  x_1p <= 10
+     *  x_2m <= 1
+     *  x_2p <= 1
+     *  x_3m <= 0.1
+     *  x_3p <= 0.1
      *  x_1m >= 0
      *  x_1p >= 0
      *  x_2m >= 0
      *  x_2p >= 0
      *  x_3m >= 0
-     *  x_3p <= 0
+     *  x_3p >= 0
      *
      *  In matrix representation, we have the following:
      *  General:
@@ -188,16 +265,34 @@ TEST(TestLpSolver, TestToStandardForm) {
      *       1   0   10
      *       0   8  -3
      *       2  -6   0
-     *      -1   0   0
-     *  A = -1   0   0
-     *       0  -1   0
-     *       0  -1   0
-     *       0   0  -1
-     *       0   0  -1
+     *       1   0   0
+     *  A =  1   0   0
+     *       0   1   0
+     *       0   1   0
+     *       0   0   1
+     *       0   0   1
      *
      *  b^T = 50 10 3 -10 10 -1 1 -0.1 0.1
      *
      *  c^T = 1  2 -3
+     *
+     *  This is wrong!
+     *  Standard form is:
+     *  Ax = b
+     *  x >= 0
+     * So need to reformulate the below by adding slack variables to transform
+     * all inequality constraints to equality constraints.
+     * Also, maybe the assumption should be constraints on the form
+     *  Ax <= b instead of >= to make adding slack variables a bit easier.
+     *
+     *  Slacking is done as follows:
+     *  Given the following constraint (sigular, view as a single row)
+     *  Ax <= b
+     *  You convert it to equality by adding a slack variable s:
+     *  Ax + s = b
+     *  s >= 0.
+     *  If you have Ax >= b then you have to add
+     *  -s which does not look as clean.
      *
      *  Standard:
      *
@@ -239,8 +334,8 @@ TEST(TestLpSolver, TestToStandardForm) {
     // Constraint bounds
     std::vector<std::pair<double, double>> constraint_bounds = {
         {std::numeric_limits<double>::lowest(), 50},
-        {10, std::numeric_limits<double>::max()},
-        {3, std::numeric_limits<double>::max()}};
+        {std::numeric_limits<double>::lowest(), 10},
+        {std::numeric_limits<double>::lowest(), 3}};
 
     // Add the variables
     for (int i = 0; i < 3; ++i) {
